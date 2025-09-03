@@ -1,0 +1,405 @@
+# bvic_pipeline.py
+# -*- coding: utf-8 -*-
+"""
+BVIC — BanVic: ingestão, tratamento, KPIs, análises e export.
+Arquivos esperados (você já forneceu):
+  /mnt/data/agencias.csv
+  /mnt/data/clientes.csv
+  /mnt/data/colaborador_agencia.csv
+  /mnt/data/colaboradores.csv
+  /mnt/data/contas.csv
+  /mnt/data/propostas_credito.csv
+  /mnt/data/transacoes.csv
+
+Saídas em out_bvic/:
+  - fato_transacoes_integrado.csv
+  - fato_diario.csv
+  - mix_por_tipo.csv
+  - ritmo_por_dow.csv
+  - ranking_agencias_6m.csv
+  - (crédito) credito_media_aprov_por_dow.csv, credito_volume_financiado_por_dow.csv
+"""
+
+import os
+import sys
+import pandas as pd
+import numpy as np
+
+# --------------------------------------------------------------------------------------
+# CONFIG: diretório dos CSVs (por padrão o seu ambiente atual)
+# --------------------------------------------------------------------------------------
+CSV_DIR = "/mnt/data"   # ajuste se for rodar local (ex.: r"C:\BanVic\dados")
+OUTDIR  = "out_bvic"
+
+PATHS = {
+    "transacoes": os.path.join(CSV_DIR, "transacoes.csv"),
+    "contas": os.path.join(CSV_DIR, "contas.csv"),
+    "agencias": os.path.join(CSV_DIR, "agencias.csv"),
+    "clientes": os.path.join(CSV_DIR, "clientes.csv"),
+    "colaboradores": os.path.join(CSV_DIR, "colaboradores.csv"),
+    "colaborador_agencia": os.path.join(CSV_DIR, "colaborador_agencia.csv"),
+    "propostas_credito": os.path.join(CSV_DIR, "propostas_credito.csv"),
+}
+
+# --------------------------------------------------------------------------------------
+# MAPA DE SINÔNIMOS DE COLUNAS (flexível a esquemas)
+# --------------------------------------------------------------------------------------
+SYN = {
+    "transacoes": {
+        "cod_transacao": ["cod_transacao", "id_transacao", "id"],
+        "data_hora":     ["data_hora", "datahora", "timestamp", "data", "dt"],
+        "nome_transacao":["nome_transacao", "tipo", "tipo_transacao", "descricao"],
+        "valor":         ["valor_transacao", "valor", "vlr", "amount"],
+        "num_conta":     ["num_conta", "conta", "id_conta", "numero_conta"],
+    },
+    "contas": {
+        "num_conta":  ["num_conta", "conta", "id_conta", "numero_conta"],
+        "cod_agencia":["cod_agencia", "agencia", "id_agencia"],
+        "cod_cliente":["cod_cliente", "cliente", "id_cliente"],
+    },
+    "agencias": {
+        "cod_agencia":  ["cod_agencia", "agencia", "id_agencia"],
+        "nome_agencia": ["nome", "nome_agencia", "agencia_nome"],
+        "uf":           ["uf", "estado", "sigla_uf"],
+    },
+    "propostas_credito": {
+        "data_hora":         ["data_hora", "datahora", "timestamp", "data", "dt"],
+        "status":            ["status_proposta", "status", "situacao"],
+        "valor_financiado":  ["valor_financiado", "valor", "vlr"],
+        "taxa_juros_mensal": ["taxa_juros_mensal", "taxa_juros", "taxa"],
+    },
+}
+
+# --------------------------------------------------------------------------------------
+# NOMES EM PT-BR (sem depender de locale)
+# --------------------------------------------------------------------------------------
+MES_PT = {
+    1:"janeiro", 2:"fevereiro", 3:"março", 4:"abril", 5:"maio", 6:"junho",
+    7:"julho", 8:"agosto", 9:"setembro", 10:"outubro", 11:"novembro", 12:"dezembro"
+}
+DOW_PT = ["segunda-feira","terça-feira","quarta-feira","quinta-feira","sexta-feira","sábado","domingo"]
+
+# --------------------------------------------------------------------------------------
+# UTILITÁRIOS
+# --------------------------------------------------------------------------------------
+def _find_col(df, aliases, required=True):
+    """Encontra a primeira coluna presente dentre 'aliases' (case-insensitive)."""
+    if df is None:
+        if required:
+            raise KeyError("DataFrame ausente.")
+        return None
+    cols = {c.lower(): c for c in df.columns}
+    for a in aliases:
+        if a.lower() in cols:
+            return cols[a.lower()]
+    if required:
+        raise KeyError(f"Não encontrei nenhuma das colunas {aliases} em {list(df.columns)}")
+    return None
+
+def _coerce_numeric(s):
+    """Converte série para número tolerando 'R$ ', milhar e vírgula decimal."""
+    if not pd.api.types.is_numeric_dtype(s):
+        s = s.astype(str)
+        s = s.str.replace("R$", "", regex=False).str.strip()
+        s = s.str.replace(".", "", regex=False)       # remove separador de milhar
+        s = s.str.replace(",", ".", regex=False)      # vírgula -> ponto
+    return pd.to_numeric(s, errors="coerce")
+
+def _ensure_outdir():
+    os.makedirs(OUTDIR, exist_ok=True)
+
+def _read_csv_auto(path):
+    return pd.read_csv(path, sep=None, engine="python")
+
+# --------------------------------------------------------------------------------------
+# 1) INGESTÃO
+# --------------------------------------------------------------------------------------
+def BVIC_INGESTAO():
+    dfs = {}
+    for k, p in PATHS.items():
+        try:
+            if not os.path.exists(p):
+                print(f"[AVISO] Arquivo não encontrado: {p}")
+                dfs[k] = None
+                continue
+            dfs[k] = _read_csv_auto(p)
+            print(f"[OK] {k}: {p}  (linhas={len(dfs[k])})")
+        except Exception as e:
+            print(f"[ERRO] Falha ao ler {k} ({p}): {e}")
+            dfs[k] = None
+    # Checagens mínimas
+    if dfs["transacoes"] is None:
+        raise FileNotFoundError("transacoes.csv é obrigatório e não pôde ser lido.")
+    if dfs["contas"] is None:
+        raise FileNotFoundError("contas.csv é obrigatório e não pôde ser lido.")
+    if dfs["agencias"] is None:
+        raise FileNotFoundError("agencias.csv é obrigatório e não pôde ser lido.")
+    return dfs
+
+# --------------------------------------------------------------------------------------
+# 2) TRATAMENTO / INTEGRAÇÃO
+# --------------------------------------------------------------------------------------
+def BVIC_TRATAMENTO_E_INTEGRACAO(dfs):
+    t = dfs["transacoes"].copy()
+    c = dfs["contas"].copy()
+    a = dfs["agencias"].copy()
+
+    # ---- Transações
+    col_dt    = _find_col(t, SYN["transacoes"]["data_hora"])
+    col_tipo  = _find_col(t, SYN["transacoes"]["nome_transacao"])
+    col_valor = _find_col(t, SYN["transacoes"]["valor"])
+    col_conta = _find_col(t, SYN["transacoes"]["num_conta"], required=False)
+    col_codtx = _find_col(t, SYN["transacoes"]["cod_transacao"], required=False)
+
+    # Timestamps: remove " UTC" e converte
+    t[col_dt] = t[col_dt].astype(str).str.replace(" UTC", "", regex=False)
+    t["data_hora"] = pd.to_datetime(t[col_dt], errors="coerce")
+    t["data"]      = t["data_hora"].dt.date
+
+    # Valores e tipos
+    t["valor"]          = _coerce_numeric(t[col_valor])
+    t["nome_transacao"] = t[col_tipo].astype("string")
+    t["num_conta"]      = t[col_conta].astype("string") if col_conta else pd.Series(pd.NA, index=t.index, dtype="string")
+    if col_codtx:
+        t["cod_transacao"] = t[col_codtx].astype("string")
+
+    # Limpeza básica
+    t = t.dropna(subset=["data_hora", "valor"]).drop_duplicates()
+
+    # Derivados de data
+    dt = pd.to_datetime(t["data_hora"])
+    t["ano"]      = dt.dt.year
+    t["mes"]      = dt.dt.month
+    t["dow_idx"]  = dt.dt.dayofweek                 # 0 seg ... 6 dom
+    t["dow_nome"] = t["dow_idx"].map(lambda i: DOW_PT[i] if pd.notna(i) and int(i) in range(7) else None)
+    t["direcao"]  = np.where(t["valor"] >= 0, "entrada", "saida")
+
+    # ---- Contas
+    col_c_num = _find_col(c, SYN["contas"]["num_conta"])
+    col_c_ag  = _find_col(c, SYN["contas"]["cod_agencia"])
+    col_c_cli = _find_col(c, SYN["contas"]["cod_cliente"], required=False)
+    c_norm = c.rename(columns={col_c_num:"num_conta", col_c_ag:"cod_agencia"})
+    if col_c_cli: c_norm = c_norm.rename(columns={col_c_cli:"cod_cliente"})
+    c_norm["num_conta"] = c_norm["num_conta"].astype("string")
+
+    # ---- Agências
+    col_a_cod = _find_col(a, SYN["agencias"]["cod_agencia"])
+    col_a_nom = _find_col(a, SYN["agencias"]["nome_agencia"])
+    col_a_uf  = _find_col(a, SYN["agencias"]["uf"], required=False)
+    a_norm = a.rename(columns={col_a_cod:"cod_agencia", col_a_nom:"nome_agencia"})
+    if col_a_uf: a_norm = a_norm.rename(columns={col_a_uf:"uf"})
+
+    # Integração
+    keys_contas = ["num_conta", "cod_agencia"] + (["cod_cliente"] if "cod_cliente" in c_norm.columns else [])
+    t = t.merge(c_norm[keys_contas], on="num_conta", how="left")
+    keys_ag = ["cod_agencia", "nome_agencia"] + (["uf"] if "uf" in a_norm.columns else [])
+    t = t.merge(a_norm[keys_ag], on="cod_agencia", how="left")
+
+    # Outliers por tipo (flag 3*IQR)
+    def _flag_outlier(s):
+        if s.isna().all(): return pd.Series([False]*len(s), index=s.index)
+        q1, q3 = s.quantile([0.25, 0.75])
+        iqr = q3 - q1
+        low, high = q1 - 3*iqr, q3 + 3*iqr
+        return ~s.between(low, high)
+    t["is_outlier_valor"] = t.groupby("nome_transacao", dropna=False)["valor"].transform(_flag_outlier)
+
+    return t
+
+# --------------------------------------------------------------------------------------
+# 3) DIMENSÃO DE DATAS (sem locale)
+# --------------------------------------------------------------------------------------
+def BVIC_DIM_DATE(dt_min, dt_max):
+    date_index = pd.date_range(pd.to_datetime(dt_min), pd.to_datetime(dt_max), freq="D")
+    dim = pd.DataFrame({"data_dt": date_index})
+    dim["data"]       = dim["data_dt"].dt.date
+    dim["ano"]        = dim["data_dt"].dt.year
+    dim["mes"]        = dim["data_dt"].dt.month
+    dim["nome_mes"]   = dim["mes"].map(MES_PT)
+    dim["dow_idx"]    = dim["data_dt"].dt.dayofweek
+    dim["dow_nome"]   = dim["dow_idx"].map(lambda i: DOW_PT[i])
+    dim["is_par"]     = (dim["mes"] % 2 == 0)
+    dim["semana_iso"] = dim["data_dt"].dt.isocalendar().week.astype(int)
+    dim["trimestre"]  = dim["data_dt"].dt.quarter
+    dim["is_weekend"] = dim["dow_idx"].isin([5,6])
+    return dim.drop(columns=["data_dt"])
+
+# --------------------------------------------------------------------------------------
+# 4) KPIs
+# --------------------------------------------------------------------------------------
+def BVIC_KPIS_GERAIS(t):
+    n       = len(t)
+    vol_liq = float(t["valor"].sum())
+    ticket  = float(vol_liq / n) if n > 0 else np.nan
+    by_day  = t.groupby("data", as_index=False).size().rename(columns={"size":"qtd"})
+    media_tx_dia = float(by_day["qtd"].mean()) if not by_day.empty else np.nan
+    return {"n_transacoes": n, "volume_liquido": vol_liq, "ticket_medio": ticket, "media_transacoes_dia": media_tx_dia}
+
+# --------------------------------------------------------------------------------------
+# 5) MIX POR TIPO
+# --------------------------------------------------------------------------------------
+def BVIC_MIX_TIPO(t):
+    g = t.groupby("nome_transacao", dropna=False).agg(qtd=("valor","size"), volume=("valor","sum")).reset_index()
+    g["ticket_medio"] = g["volume"] / g["qtd"]
+    g["part_qtd_%"]   = 100 * g["qtd"] / g["qtd"].sum()
+    return g.sort_values(["qtd","volume"], ascending=[False, False])
+
+# --------------------------------------------------------------------------------------
+# 6) RITMO POR DOW
+# --------------------------------------------------------------------------------------
+def BVIC_RITMO_DOW(t):
+    daily = t.groupby("data", as_index=False).agg(qtd=("valor","size"), volume=("valor","sum"))
+    dim   = BVIC_DIM_DATE(daily["data"].min(), daily["data"].max())
+    d     = daily.merge(dim[["data","dow_idx","dow_nome"]], on="data", how="left")
+    agg = d.groupby(["dow_idx","dow_nome"], as_index=False).agg(
+        media_tx_dia=("qtd","mean"),
+        volume_total=("volume","sum"),
+        volume_medio_dia=("volume","mean")
+    ).sort_values("dow_idx")
+    part = d.groupby(["dow_idx","dow_nome"], as_index=False)["qtd"].sum().rename(columns={"qtd":"qtd_total"})
+    total_qtd = float(part["qtd_total"].sum() or 0.0)
+    part["part_qtd_%"] = np.where(total_qtd>0, 100*part["qtd_total"]/total_qtd, 0.0)
+    return agg.merge(part[["dow_idx","part_qtd_%"]], on="dow_idx", how="left")
+
+# --------------------------------------------------------------------------------------
+# 7) SAZONALIDADE (pares x ímpares) — randomização
+# --------------------------------------------------------------------------------------
+def BVIC_SAZONALIDADE_PAR_IMPAR_TESTE(t, n_perm=10000, seed=123):
+    daily = t.groupby("data", as_index=False).agg(volume=("valor","sum"))
+    monthly = (
+        daily.assign(mes_ref=pd.to_datetime(daily["data"]).values.astype("datetime64[M]"))
+             .groupby("mes_ref", as_index=False)["volume"].mean()
+    )
+    monthly["is_par"] = monthly["mes_ref"].dt.month % 2 == 0
+    even = monthly.loc[monthly["is_par"], "volume"].to_numpy()
+    odd  = monthly.loc[~monthly["is_par"], "volume"].to_numpy()
+    if len(even)==0 or len(odd)==0:
+        return {"delta_pares_menos_impares": np.nan, "p_valor_unilateral": np.nan,
+                "n_meses_par": len(even), "n_meses_impar": len(odd)}
+    obs = float(even.mean() - odd.mean())
+    rng = np.random.default_rng(seed)
+    combined = np.concatenate([even, odd])
+    n_even = len(even)
+    count = 0
+    for _ in range(n_perm):
+        rng.shuffle(combined)
+        diff = combined[:n_even].mean() - combined[n_even:].mean()
+        if diff >= obs:
+            count += 1
+    p = (count + 1) / (n_perm + 1)
+    return {"delta_pares_menos_impares": obs, "p_valor_unilateral": p,
+            "n_meses_par": len(even), "n_meses_impar": len(odd)}
+
+# --------------------------------------------------------------------------------------
+# 8) RANKING AGÊNCIAS (últimos 6 meses)
+# --------------------------------------------------------------------------------------
+def BVIC_RANKING_AGENCIAS_6M(t):
+    latest = pd.to_datetime(t["data"]).max()
+    cutoff = latest - pd.DateOffset(months=6)
+    tx6 = t[pd.to_datetime(t["data"]) > cutoff]
+    r = (tx6.groupby(["cod_agencia","nome_agencia"], dropna=False)
+              .size().reset_index(name="qtd_transacoes")
+              .sort_values("qtd_transacoes", ascending=False))
+    r["participacao_%"] = 100 * r["qtd_transacoes"] / r["qtd_transacoes"].sum()
+    return r
+
+# --------------------------------------------------------------------------------------
+# 9) CRÉDITO (aprov./dia e volume financiado por DOW)
+# --------------------------------------------------------------------------------------
+def BVIC_CREDITO_METRICAS(dfs):
+    pc = dfs.get("propostas_credito")
+    if pc is None or pc.empty:
+        return None, None
+    col_dt = _find_col(pc, SYN["propostas_credito"]["data_hora"])
+    col_st = _find_col(pc, SYN["propostas_credito"]["status"])
+    col_vl = _find_col(pc, SYN["propostas_credito"]["valor_financiado"])
+
+    pc[col_dt] = pc[col_dt].astype(str).str.replace(" UTC", "", regex=False)
+    pc["data_hora"] = pd.to_datetime(pc[col_dt], errors="coerce")
+    pc["data"]      = pc["data_hora"].dt.date
+    pc["valor_financiado"] = _coerce_numeric(pc[col_vl])
+    pc["dow_idx"]   = pd.to_datetime(pc["data_hora"]).dt.dayofweek
+    pc["dow_nome"]  = pc["dow_idx"].map(lambda i: DOW_PT[i] if pd.notna(i) and int(i) in range(7) else None)
+
+    aprov = pc[pc[col_st].astype(str).str.lower().str.contains("aprov", na=False)].copy()
+    if aprov.empty:
+        return None, None
+
+    aprov_daily = aprov.groupby("data").size().reset_index(name="aprov_dia")
+    dim = BVIC_DIM_DATE(aprov_daily["data"].min(), aprov_daily["data"].max())
+    aprov_dow = (
+        aprov_daily.merge(dim[["data","dow_idx","dow_nome"]], on="data", how="left")
+                   .groupby(["dow_idx","dow_nome"], as_index=False)["aprov_dia"].mean()
+                   .rename(columns={"aprov_dia":"media_aprov_dia"})
+                   .sort_values("dow_idx")
+    )
+    volfin_dow = (
+        aprov.groupby(["dow_idx","dow_nome"], as_index=False)["valor_financiado"]
+             .sum().rename(columns={"valor_financiado":"volume_financiado_total"})
+             .sort_values("dow_idx")
+    )
+    return aprov_dow, volfin_dow
+
+# --------------------------------------------------------------------------------------
+# 10) EXPORT PARA BI
+# --------------------------------------------------------------------------------------
+def BVIC_EXPORT_PARA_BI(t, aprov_dow=None, volfin_dow=None):
+    _ensure_outdir()
+    # Fatos diários
+    daily = t.groupby("data", as_index=False).agg(qtd=("valor","size"), volume=("valor","sum"))
+    daily.to_csv(os.path.join(OUTDIR, "fato_diario.csv"), index=False)
+    # Mix por tipo
+    BVIC_MIX_TIPO(t).to_csv(os.path.join(OUTDIR, "mix_por_tipo.csv"), index=False)
+    # Ritmo por DOW
+    BVIC_RITMO_DOW(t).to_csv(os.path.join(OUTDIR, "ritmo_por_dow.csv"), index=False)
+    # Ranking 6m
+    BVIC_RANKING_AGENCIAS_6M(t).to_csv(os.path.join(OUTDIR, "ranking_agencias_6m.csv"), index=False)
+    # Crédito
+    if aprov_dow is not None:
+        aprov_dow.to_csv(os.path.join(OUTDIR, "credito_media_aprov_por_dow.csv"), index=False)
+    if volfin_dow is not None:
+        volfin_dow.to_csv(os.path.join(OUTDIR, "credito_volume_financiado_por_dow.csv"), index=False)
+    # Fato transacional integrado (para BI)
+    cols_export = [c for c in ["data","data_hora","valor","direcao","nome_transacao",
+                               "num_conta","cod_agencia","nome_agencia","cod_cliente",
+                               "ano","mes","dow_idx","dow_nome","is_outlier_valor"] if c in t.columns]
+    t[cols_export].to_csv(os.path.join(OUTDIR, "fato_transacoes_integrado.csv"), index=False)
+
+# --------------------------------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------------------------------
+def main():
+    print("[BVIC] Lendo CSVs a partir de:", CSV_DIR)
+    dfs = BVIC_INGESTAO()
+
+    print("[BVIC] Tratando e integrando...")
+    t = BVIC_TRATAMENTO_E_INTEGRACAO(dfs)
+
+    print("[BVIC] KPIs gerais:")
+    kpis = BVIC_KPIS_GERAIS(t)
+    for k,v in kpis.items():
+        print(f"  - {k}: {v:,.2f}" if isinstance(v, float) else f"  - {k}: {v}")
+
+    print("[BVIC] Mix por tipo (top 10):")
+    print(BVIC_MIX_TIPO(t).head(10))
+
+    print("[BVIC] Ritmo por dia da semana:")
+    print(BVIC_RITMO_DOW(t))
+
+    print("[BVIC] Sazonalidade pares x ímpares (randomização):")
+    print(BVIC_SAZONALIDADE_PAR_IMPAR_TESTE(t))
+
+    print("[BVIC] Ranking de agências (6m):")
+    print(BVIC_RANKING_AGENCIAS_6M(t).head(10))
+
+    print("[BVIC] Métricas de crédito (se houver):")
+    aprov_dow, volfin_dow = BVIC_CREDITO_METRICAS(dfs)
+    if aprov_dow is not None:
+        print("  - Média aprovações/dia por DOW:\n", aprov_dow)
+        print("  - Volume financiado total por DOW:\n", volfin_dow)
+    else:
+        print("  - Sem dados de crédito aprovados ou arquivo ausente.")
+
+    print(f"[BVIC] Exportando CSVs para {OUTDIR}/ ...")
+    BVIC_EXPORT_PARA_BI(t, aprov_dow, volfin_dow)
+    print("[BVIC] Concluído com sucesso ✅")
