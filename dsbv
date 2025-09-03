@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 BVIC — BanVic: ingestão, tratamento, KPIs, análises e export.
-Arquivos esperados (você já forneceu):
+Arquivos esperados:
   /mnt/data/agencias.csv
   /mnt/data/clientes.csv
   /mnt/data/colaborador_agencia.csv
